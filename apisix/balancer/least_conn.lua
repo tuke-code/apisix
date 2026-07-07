@@ -24,20 +24,64 @@ local pairs = pairs
 local _M = {}
 
 
+-- Per-worker in-flight connection count for each (upstream, server), kept outside
+-- the picker so it survives balancer recreation. The picker (and its heap) is
+-- rebuilt whenever the upstream changes, e.g. on scaling. Without this, every
+-- score is reset to the base weight and connections already established are
+-- forgotten, so the newly added nodes are not preferred and long-lived
+-- connections (e.g. WebSocket) stay skewed on the original nodes. See #12217.
+-- structure: conn_count[upstream_key][server] = in-flight count
+local conn_count = {}
+
+
 local function least_score(a, b)
     return a.score < b.score
 end
 
 
 function _M.new(up_nodes, upstream)
+    -- resource_key/resource_id identifies the upstream and is stable across node
+    -- scaling, unlike the picker version which changes whenever the nodes change
+    local up_key = upstream.resource_key or upstream.resource_id
+    local counts
+    if up_key then
+        counts = conn_count[up_key]
+        if not counts then
+            counts = {}
+            conn_count[up_key] = counts
+        end
+        -- drop drained servers no longer in the upstream to bound memory on churn
+        for server, count in pairs(counts) do
+            if count <= 0 and not up_nodes[server] then
+                counts[server] = nil
+            end
+        end
+    end
+
+    local function update_conn_count(server, delta)
+        if not counts then
+            return
+        end
+        local count = (counts[server] or 0) + delta
+        if count <= 0 and not up_nodes[server] then
+            counts[server] = nil
+        else
+            counts[server] = count
+        end
+    end
+
     local servers_heap = binaryHeap.minUnique(least_score)
     for server, weight in pairs(up_nodes) do
-        local score = 1 / weight
+        local effect_weight = 1 / weight
+        -- seed the score with the connections this worker already holds so that
+        -- surviving nodes keep their load while freshly added nodes start empty
+        -- and are preferred right after scaling
+        local held = counts and counts[server] or 0
         -- Note: the argument order of insert is different from others
         servers_heap:insert({
             server = server,
-            effect_weight = 1 / weight,
-            score = score,
+            effect_weight = effect_weight,
+            score = (held + 1) * effect_weight,
         }, server)
     end
 
@@ -77,6 +121,7 @@ function _M.new(up_nodes, upstream)
 
             info.score = info.score + info.effect_weight
             servers_heap:update(server, info)
+            update_conn_count(server, 1)
             return server
         end,
         after_balance = function (ctx, before_retry)
@@ -84,6 +129,7 @@ function _M.new(up_nodes, upstream)
             local info = servers_heap:valueByPayload(server)
             info.score = info.score - info.effect_weight
             servers_heap:update(server, info)
+            update_conn_count(server, -1)
 
             if not before_retry then
                 if ctx.balancer_tried_servers then
