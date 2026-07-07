@@ -72,7 +72,56 @@ GET /t
 
 
 
-=== TEST 2: scale down drops the removed node, remaining nodes balance
+=== TEST 2: a drained node returns to the pool across balancer recreation
+--- config
+    location /t {
+        content_by_lua_block {
+            local least_conn = require("apisix.balancer.least_conn")
+            local up = {resource_key = "/upstreams/lc-drain"}
+
+            local nodes = {["127.0.0.1:1980"] = 1, ["127.0.0.1:1981"] = 1}
+            local p1 = least_conn.new(nodes, up)
+
+            -- hold 4 in-flight connections, 2 land on each node
+            local ctx = {}
+            local held = {}
+            for _ = 1, 4 do
+                held[#held + 1] = p1.get(ctx)
+            end
+
+            -- drain every connection on 1980
+            for _, s in ipairs(held) do
+                if s == "127.0.0.1:1980" then
+                    ctx.balancer_server = s
+                    p1.after_balance(ctx, false)
+                end
+            end
+
+            -- picker recreated: 1980 is back to baseline and must be preferred
+            -- over 1981 which is still holding connections
+            local p2 = least_conn.new(nodes, up)
+            local s = p2.get(ctx)
+            ngx.say(s)
+
+            -- release the rest so repeated runs start from a clean state
+            ctx.balancer_server = s
+            p2.after_balance(ctx, false)
+            for _, h in ipairs(held) do
+                if h == "127.0.0.1:1981" then
+                    ctx.balancer_server = h
+                    p2.after_balance(ctx, false)
+                end
+            end
+        }
+    }
+--- request
+GET /t
+--- response_body
+127.0.0.1:1980
+
+
+
+=== TEST 3: scale down drops the removed node, remaining nodes balance
 --- config
     location /t {
         content_by_lua_block {

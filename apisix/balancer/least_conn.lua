@@ -63,6 +63,13 @@ function _M.new(up_nodes, upstream)
             return
         end
         local count = (counts[server] or 0) + delta
+        -- an in-flight count is never negative; clamp it so a double release
+        -- (e.g. retries exhausted, where balancer.lua releases the last server
+        -- once on retry entry and again in the log phase) cannot persist a
+        -- negative value that would over-prefer the server on the next rebuild
+        if count < 0 then
+            count = 0
+        end
         if count <= 0 and not up_nodes[server] then
             counts[server] = nil
         else
